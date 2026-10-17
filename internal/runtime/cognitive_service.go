@@ -52,6 +52,13 @@ type cognitiveState struct {
 	// but cannot clear an unresolved effect. Disabling/enabling the loop
 	// never clears the fence.
 	Blocked string `json:"blocked,omitempty"`
+	// Intent* is the write-ahead admission record, saved before a workflow
+	// is started. If the process dies before ActiveRunID is saved, the next
+	// attempt finds the admitted run by this exact parent and operation key
+	// and settles it instead of admitting the same window again.
+	IntentOpKey       string `json:"intent_op_key,omitempty"`
+	IntentParentRunID string `json:"intent_parent_run_id,omitempty"`
+	IntentThrough     uint64 `json:"intent_through,omitempty"`
 }
 
 // cognitiveSupervisorSessionID is the host-owned supervisor's session.
@@ -375,64 +382,11 @@ func (s *Service) cognitiveAttempt(ctx context.Context, manual bool) (laputaevol
 		}
 	}
 	now := b.now()
-	if st.ActiveRunID != "" {
-		run, getErr := s.deps.Runs.GetRun(ctx, domain.RunID(st.ActiveRunID))
-		switch {
-		case getErr != nil && errors.Is(getErr, storage.ErrNotFound):
-			st.ActiveRunID = ""
-		case getErr != nil:
-			return laputaevolution.Eligibility{}, getErr
-		case run.Status.Terminal():
-			switch {
-			case run.Status == domain.RunCompleted:
-				if s.cognitiveWindowResolved(ctx, st) {
-					st.Watermark = st.PendingThrough
-					st.LastCompletedUnixMS = now
-					st.Attempt = 0
-				} else {
-					st.Blocked = cognitiveBlockUnknown
-				}
-			case run.Status == domain.RunCancelled:
-				// Human cancellation pauses; automatic admission never
-				// retries it.
-				if st.Blocked == cognitiveBlockUnknown || s.cognitiveRunBlocked(ctx, run.ID) {
-					st.Blocked = cognitiveBlockUnknown
-				} else {
-					st.Blocked = cognitiveBlockCancelled
-				}
-			case s.cognitiveRunBlocked(ctx, run.ID):
-				// Unknown outcome, missing binding or authority change:
-				// effects may already be applied, so retrying could
-				// duplicate them.
-				st.Blocked = cognitiveBlockUnknown
-			default:
-				// A transiently failed run never advances the watermark; the
-				// next wake retries the window under a new attempt suffix,
-				// bounded at cognitiveMaxAttempts.
-				st.Attempt++
-				if st.Attempt >= cognitiveMaxAttempts {
-					st.Blocked = cognitiveBlockExhausted
-				}
-			}
-			if st.Blocked != cognitiveBlockUnknown {
-				st.ActiveRunID = ""
-			}
-		case run.Kind == domain.RunKindWorkflow:
-			// A recovered unknown workflow intentionally has no native
-			// terminal. Expose its committed engine fence instead of
-			// describing the lost process as still actively running.
-			engine, err := s.inofyEngine()
-			if err != nil {
-				return laputaevolution.Eligibility{}, err
-			}
-			state, err := engine.LoadWorkflowStep(ctx, run.ID)
-			if err != nil {
-				return laputaevolution.Eligibility{}, err
-			}
-			if state.Projection != nil && state.Projection.Status == storage.WorkflowStepRecoveryRequired {
-				st.Blocked = cognitiveBlockUnknown
-			}
-		}
+	if err := s.reconcileCognitiveIntent(ctx, &st); err != nil {
+		return laputaevolution.Eligibility{}, err
+	}
+	if err := s.settleCognitiveActiveRun(ctx, &st, now); err != nil {
+		return laputaevolution.Eligibility{}, err
 	}
 	high, err := s.cognitiveHighWatermark(ctx, st)
 	if err != nil {
@@ -500,29 +454,125 @@ func (s *Service) cognitiveAttempt(ctx context.Context, manual bool) (laputaevol
 	// not permanently block the same input (terminal dedupe returns
 	// Created:false instead of retrying).
 	opKey := fmt.Sprintf("cognitive:%s:%d-%d:a%d", b.SourceID, st.Watermark, high, st.Attempt)
+	// Write ahead: persist the intent (and the supervisor that parents it)
+	// before the workflow can commit, so a crash in between is reconciled
+	// by reconcileCognitiveIntent rather than admitting the window again.
+	st.IntentOpKey, st.IntentParentRunID, st.IntentThrough = opKey, string(parentID), high
+	if err := s.saveCognitiveState(ctx, st, version); err != nil {
+		return laputaevolution.Eligibility{}, err
+	}
+	if _, version, err = s.loadCognitiveState(ctx); err != nil {
+		return laputaevolution.Eligibility{}, err
+	}
 	started, err := s.StartCognitiveWorkflow(ctx, parentID, opKey, TrustedStrategyDIVA, input)
 	if err != nil {
 		return laputaevolution.Eligibility{}, err
 	}
-	if started.Created {
-		st.ActiveRunID = string(started.Run.ID)
-		st.PendingThrough = high
-	} else if !started.Run.Status.Terminal() {
-		// Crash between workflow creation and state save: reconcile the
-		// persisted operation identity by adopting the live run instead
-		// of minting a new attempt.
-		st.ActiveRunID = string(started.Run.ID)
-		st.PendingThrough = high
-	} else {
-		st.Attempt++
-		if st.Attempt >= cognitiveMaxAttempts {
-			st.Blocked = cognitiveBlockExhausted
+	// Adopt whatever run the operation key names: a new admission, a live
+	// run left by a crash, or a terminal one that dedupe returned. A
+	// terminal run is settled now, so a completed window advances instead
+	// of being counted as a failed attempt.
+	st.IntentOpKey, st.IntentParentRunID, st.IntentThrough = "", "", 0
+	st.ActiveRunID = string(started.Run.ID)
+	st.PendingThrough = high
+	if started.Run.Status.Terminal() {
+		if err := s.settleCognitiveActiveRun(ctx, &st, now); err != nil {
+			return laputaevolution.Eligibility{}, err
 		}
 	}
 	if err := s.saveCognitiveState(ctx, st, version); err != nil {
 		return laputaevolution.Eligibility{}, err
 	}
 	return elig, nil
+}
+
+// settleCognitiveActiveRun classifies the recorded ActiveRunID: a completed
+// run advances the watermark, a transient failure counts one attempt, and a
+// cancelled or unknown outcome blocks automatic admission.
+func (s *Service) settleCognitiveActiveRun(ctx context.Context, st *cognitiveState, now int64) error {
+	if st.ActiveRunID != "" {
+		run, getErr := s.deps.Runs.GetRun(ctx, domain.RunID(st.ActiveRunID))
+		switch {
+		case getErr != nil && errors.Is(getErr, storage.ErrNotFound):
+			st.ActiveRunID = ""
+		case getErr != nil:
+			return getErr
+		case run.Status.Terminal():
+			switch {
+			case run.Status == domain.RunCompleted:
+				if s.cognitiveWindowResolved(ctx, *st) {
+					st.Watermark = st.PendingThrough
+					st.LastCompletedUnixMS = now
+					st.Attempt = 0
+				} else {
+					st.Blocked = cognitiveBlockUnknown
+				}
+			case run.Status == domain.RunCancelled:
+				// Human cancellation pauses; automatic admission never
+				// retries it.
+				if st.Blocked == cognitiveBlockUnknown || s.cognitiveRunBlocked(ctx, run.ID) {
+					st.Blocked = cognitiveBlockUnknown
+				} else {
+					st.Blocked = cognitiveBlockCancelled
+				}
+			case s.cognitiveRunBlocked(ctx, run.ID):
+				// Unknown outcome, missing binding or authority change:
+				// effects may already be applied, so retrying could
+				// duplicate them.
+				st.Blocked = cognitiveBlockUnknown
+			default:
+				// A transiently failed run never advances the watermark; the
+				// next wake retries the window under a new attempt suffix,
+				// bounded at cognitiveMaxAttempts.
+				st.Attempt++
+				if st.Attempt >= cognitiveMaxAttempts {
+					st.Blocked = cognitiveBlockExhausted
+				}
+			}
+			if st.Blocked != cognitiveBlockUnknown {
+				st.ActiveRunID = ""
+			}
+		case run.Kind == domain.RunKindWorkflow:
+			// A recovered unknown workflow intentionally has no native
+			// terminal. Expose its committed engine fence instead of
+			// describing the lost process as still actively running.
+			engine, err := s.inofyEngine()
+			if err != nil {
+				return err
+			}
+			state, err := engine.LoadWorkflowStep(ctx, run.ID)
+			if err != nil {
+				return err
+			}
+			if state.Projection != nil && state.Projection.Status == storage.WorkflowStepRecoveryRequired {
+				st.Blocked = cognitiveBlockUnknown
+			}
+		}
+	}
+	return nil
+}
+
+// reconcileCognitiveIntent resolves a write-ahead admission intent left by
+// an attempt that stopped before saving ActiveRunID. A committed admission is
+// adopted as the active run; no admission means nothing ran and the intent
+// is dropped.
+func (s *Service) reconcileCognitiveIntent(ctx context.Context, st *cognitiveState) error {
+	if st.IntentOpKey == "" {
+		return nil
+	}
+	if st.ActiveRunID == "" {
+		rev, err := s.deps.WorkflowRevisions.GetWorkflowRevisionByOperation(ctx, domain.RunID(st.IntentParentRunID), st.IntentOpKey)
+		switch {
+		case err == nil:
+			st.ActiveRunID = string(rev.RunID)
+			st.PendingThrough = st.IntentThrough
+		case errors.Is(err, storage.ErrNotFound):
+		default:
+			return err
+		}
+	}
+	st.IntentOpKey, st.IntentParentRunID, st.IntentThrough = "", "", 0
+	return nil
 }
 
 func (s *Service) cognitiveHighWatermark(ctx context.Context, st cognitiveState) (uint64, error) {
@@ -576,8 +626,18 @@ func (s *Service) ensureCognitiveSupervisor(ctx context.Context, st *cognitiveSt
 			return "", err
 		}
 	}
-	st.SupervisorSeq++
-	runID := domain.RunID(fmt.Sprintf("run_cognitive_supervisor_%d", st.SupervisorSeq))
+	// A crash after CreateRun but before the state save leaves a supervisor
+	// whose sequence was never persisted; skip any id that already exists.
+	var runID domain.RunID
+	for {
+		st.SupervisorSeq++
+		runID = domain.RunID(fmt.Sprintf("run_cognitive_supervisor_%d", st.SupervisorSeq))
+		if _, err := s.deps.Runs.GetRun(ctx, runID); errors.Is(err, storage.ErrNotFound) {
+			break
+		} else if err != nil {
+			return "", err
+		}
+	}
 	run := domain.Run{
 		ID: runID, SessionID: sessionID, Status: domain.RunActive,
 		Kind: domain.RunKindPrimary, CreatedAt: s.deps.Cognitive.now(), RootID: runID,

@@ -548,6 +548,9 @@ func TestDeliverableReadSnapshotWriteFailure(t *testing.T) {
 	if goruntime.GOOS == "windows" {
 		t.Skip("permission fixture is unix-only")
 	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions, so the fixture cannot make scratch unwritable")
+	}
 	f := newDeliverableFixture(t)
 	f.createLiveRun(t, "run-deliv-nospace")
 	f.writeFile(t, "run-deliv-nospace", "a.txt", []byte("alpha"))

@@ -31,6 +31,22 @@ function fieldValue(node: Node, key: string): unknown {
   return config[key];
 }
 
+// Bindings are a node-level field (`node.inputs`); the runtime rejects an
+// `inputs` key inside `config`. Drafts written before this fix may still
+// carry `config.inputs`, so it is shown as a fallback and dropped on commit.
+function nodeInputs(node: Node): unknown {
+  return node.inputs ?? fieldValue(node, 'inputs');
+}
+
+function setInputs(node: Node, value: unknown): Node {
+  const next = setConfigField(node, 'inputs', undefined);
+  if (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0) {
+    delete next.inputs;
+    return next;
+  }
+  return { ...next, inputs: value as Node['inputs'] };
+}
+
 function setConfigField(node: Node, key: string, value: unknown): Node {
   const config = node.config && typeof node.config === 'object' ? { ...(node.config as Record<string, unknown>) } : {};
   if (value === undefined) delete config[key];
@@ -39,12 +55,12 @@ function setConfigField(node: Node, key: string, value: unknown): Node {
 }
 
 export function NodePanel({ artifact, node, descriptor, t, disabled, onChange, onDelete }: NodePanelProps) {
-  const [inputsDraft, setInputsDraft] = useState(() => JSON.stringify(fieldValue(node, 'inputs') ?? {}, null, 2));
+  const [inputsDraft, setInputsDraft] = useState(() => JSON.stringify(nodeInputs(node) ?? {}, null, 2));
   const [inputsError, setInputsError] = useState<string | null>(null);
   useEffect(() => {
-    setInputsDraft(JSON.stringify(fieldValue(node, 'inputs') ?? {}, null, 2));
+    setInputsDraft(JSON.stringify(nodeInputs(node) ?? {}, null, 2));
     setInputsError(null);
-  }, [node.id, node.config]);
+  }, [node.id, node.config, node.inputs]);
 
   const isExit = artifact.definition.graph.exits.includes(node.id);
   const outputName = exitOutputName(artifact, node.id);
@@ -62,7 +78,7 @@ export function NodePanel({ artifact, node, descriptor, t, disabled, onChange, o
       return;
     }
     setInputsError(null);
-    patch(setConfigField(node, 'inputs', parsed.value));
+    patch(setInputs(node, parsed.value));
   };
 
   return (

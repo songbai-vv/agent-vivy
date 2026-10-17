@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { FaceClientRPC, FaceClientStore, FaceStoreState, FullUIHost } from '@vivy/ui-sdk';
-import { FaceBridge, normalizeJournalEvent } from './face-bridge';
+import { FaceBridge, launchParentRunId, normalizeJournalEvent } from './face-bridge';
 import { WorkflowClient } from './client';
 import { TransportError } from './studio/transport';
 
@@ -69,6 +69,18 @@ describe('FaceBridge.call', () => {
     });
   });
 
+  it.each([
+    ['a finished run', { currentRun: { id: 'run-old', session_id: 'sess-1', status: 'completed', created_at: 1 } }],
+    ['a run from another session', { currentRun: { id: 'run-other', session_id: 'sess-2', status: 'active', created_at: 1 } }],
+    ['no run', { currentRun: null }],
+  ])('sends no parent_run_id for inofy.startRun when the last-viewed run is %s', async (_label, overrides) => {
+    const host = makeHost(overrides as Partial<FaceStoreState>);
+    const bridge = new FaceBridge(host.rpc, host.store);
+    await bridge.call('inofy.startRun', { workflow: 'wf-1', revision: 2, parent_run_id: 'caller-supplied' });
+    const [, params] = (host.rpc.call as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(params).not.toHaveProperty('parent_run_id');
+  });
+
   it('leaves non-startRun calls without run binding params', async () => {
     const host = makeHost();
     const bridge = new FaceBridge(host.rpc, host.store);
@@ -76,6 +88,19 @@ describe('FaceBridge.call', () => {
     const [, params] = (host.rpc.call as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(params).not.toHaveProperty('parent_run_id');
     expect(params).not.toHaveProperty('operation_id');
+  });
+});
+
+describe('launchParentRunId', () => {
+  const run = { id: 'run-1', session_id: 'sess-1', status: 'active', created_at: 1 } as FaceStoreState['currentRun'];
+  it('returns the active run of the active session', () => {
+    expect(launchParentRunId({ activeSessionId: 'sess-1', currentRun: run })).toBe('run-1');
+  });
+  it.each(['accepted', 'queued', 'completed', 'failed', 'cancelled'])('rejects a %s run', (status) => {
+    expect(launchParentRunId({ activeSessionId: 'sess-1', currentRun: { ...run!, status } as FaceStoreState['currentRun'] })).toBeNull();
+  });
+  it('rejects a run when no session is active', () => {
+    expect(launchParentRunId({ activeSessionId: null, currentRun: run })).toBeNull();
   });
 });
 

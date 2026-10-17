@@ -4,8 +4,9 @@
  * Every `inofy.*` call is bound to the active host session (the backend
  * handlers are session-scoped and fail closed without it). `inofy.startRun`
  * additionally carries the run parentage the product contract requires:
- * `parent_run_id` is the host's current run and `operation_id` a per-call
- * idempotency key, the same model the Run Inspector uses for workflow/start.
+ * `parent_run_id` is the active session's in-flight run (see
+ * `launchParentRunId`) and `operation_id` a per-call idempotency key, the
+ * same model the Run Inspector uses for workflow/start.
  *
  * The journal is the sole event authority: `subscribe("inofy.events")`
  * multiplexes onto `run/subscribe` + `run/event` notifications and pages from
@@ -74,6 +75,19 @@ export function normalizeJournalEvent(raw: JournalRow): RunEvent {
 
 const MAX_OPERATION_ID_BYTES = 128;
 
+/**
+ * The run a workflow launch may be parented to. The backend admits a child
+ * only under an active run of the caller's session, so the last-viewed run
+ * is not enough: a finished run, or one left over from another session,
+ * would be rejected. Returns null when no run qualifies.
+ */
+export function launchParentRunId(state: Pick<FaceStoreState, 'activeSessionId' | 'currentRun'>): string | null {
+  const run = state.currentRun;
+  if (!run?.id || !state.activeSessionId) return null;
+  if (run.status !== 'active' || run.session_id !== state.activeSessionId) return null;
+  return run.id;
+}
+
 export class FaceBridge implements HostBridge {
   constructor(
     private rpc: FaceClientRPC,
@@ -87,8 +101,9 @@ export class FaceBridge implements HostBridge {
     if (sessionId) body.session_id = sessionId;
     else delete body.session_id;
     if (method === 'inofy.startRun') {
-      const parent = state.currentRun;
-      if (parent?.id) body.parent_run_id = parent.id;
+      const parent = launchParentRunId(state);
+      if (parent) body.parent_run_id = parent;
+      else delete body.parent_run_id;
       if (typeof body.operation_id !== 'string' || !body.operation_id) {
         body.operation_id = crypto.randomUUID();
       }

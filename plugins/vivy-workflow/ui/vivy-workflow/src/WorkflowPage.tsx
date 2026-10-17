@@ -18,7 +18,7 @@ import { usePluginHost, usePluginTranslation } from '@vivy/ui-sdk';
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { WorkflowClient } from './client';
-import { FaceBridge } from './face-bridge';
+import { FaceBridge, launchParentRunId } from './face-bridge';
 import { EditorPane, type EditTarget } from './editor/EditorPane';
 import { RunsPane } from './panes/RunsPane';
 import { WorkflowsPane } from './panes/WorkflowsPane';
@@ -42,7 +42,7 @@ function Page({ host, client, t }: { host: FullUIHost; client: WorkflowClient; t
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [editTarget, setEditTarget] = useState<EditTarget | null>(null);
   const [focusRun, setFocusRun] = useState<string | null>(null);
-  const canRun = faceState.currentRun != null;
+  const canRun = launchParentRunId(faceState) != null;
 
   useEffect(() => {
     let alive = true;

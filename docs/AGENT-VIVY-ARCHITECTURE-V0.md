@@ -145,6 +145,24 @@ every other run closes with a definitive `run.failed` carrying the
 restart-recovery cause. Recovery is idempotent through the
 exactly-one-terminal guard. `/healthz` reports the recovery stage.
 
+**Engine upgrades: no drain, no conversion, fail closed (2026-10-17).**
+Changing the Eino pin is an ordinary restart. Checkpoint bytes are
+version-coupled and Eino makes no format promise, so a checkpoint written by
+another engine version is unreadable (`ErrCheckpointEngineVersionMismatch`),
+in both the upgrade and the downgrade direction. Vivy adds no converter, no
+version bypass and no pre-upgrade drain. A run suspended on an approval,
+question, Plan review or child approval when the binary changes is closed by
+recovery with one `run.failed` (child: `child.failed`) before the server
+listens; its pending tool never runs. Durable Work state tied to that run is
+settled in the same step: a pending Plan review it originated is marked
+`cancelled` (the Plan stays active), and a Goal round it carried settles
+through the ordinary terminal path. The Journal stays the record; nothing is
+replayed or rewritten. Operators who want to keep a paused turn should
+answer it before upgrading. Evidence:
+`TestServiceRecoverApprovalAcrossEngineUpgradeFailsClosed`,
+`TestPlanGoalPendingReviewAcrossEngineUpgradeSettles`,
+`docs/logs/2026-10-17-eino-v0.9.21/`.
+
 ## ADR-009 — History rebuild feed (V1 MA-1 decision)
 
 **Decision.** Every run enters the engine via `adk.Runner.Run` with the

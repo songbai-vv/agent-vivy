@@ -22,13 +22,20 @@ import (
 // artifact that a restart resets.
 func restartService(t *testing.T, backend *sqlite.Backend) (*Service, *testSink) {
 	t.Helper()
+	return restartServiceWithEngine(t, backend, "test-engine")
+}
+
+// restartServiceWithEngine restarts under an explicit checkpoint engine
+// version, standing in for a binary built against a different Eino pin.
+func restartServiceWithEngine(t *testing.T, backend *sqlite.Backend, engineVersion string) (*Service, *testSink) {
+	t.Helper()
 	ctx := context.Background()
 
 	ts, err := tools.Builtin(backend).Resolve([]string{tools.EchoInfoName, tools.WriteNoteName})
 	if err != nil {
 		t.Fatalf("resolve tools: %v", err)
 	}
-	checkpoints, err := NewVersionedCheckpointStore(backend.Blobs(), "test-engine")
+	checkpoints, err := NewVersionedCheckpointStore(backend.Blobs(), engineVersion)
 	if err != nil {
 		t.Fatalf("checkpoint store: %v", err)
 	}
@@ -129,6 +136,45 @@ func TestServiceRecoverResumableApproval(t *testing.T) {
 	}
 	if events[len(events)-1].Type != domain.EventRunCompleted {
 		t.Fatalf("last event = %s, want run.completed", events[len(events)-1].Type)
+	}
+}
+
+// An Eino upgrade changes the checkpoint engine version, and Eino gives no
+// checkpoint format compatibility promise. Recovery must close a run paused
+// before the upgrade as exactly one run.failed, and a late approval must not
+// resume it or run the tool.
+func TestServiceRecoverApprovalAcrossEngineUpgradeFailsClosed(t *testing.T) {
+	svc, backend, _ := newApprovalService(t, 5*time.Minute)
+	ctx := context.Background()
+
+	mustCreateSession(t, backend, "sess-1")
+	runID, err := svc.Run(ctx, "sess-1", "note that I need milk")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	approval := waitForPendingApproval(t, backend, runID)
+	waitForApprovalEvent(t, backend, runID)
+
+	upgraded, _ := restartServiceWithEngine(t, backend, "test-engine-next")
+	if err := upgraded.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	r, err := backend.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if r.Status != domain.RunFailed {
+		t.Fatalf("run status after recovery = %s, want failed", r.Status)
+	}
+	_ = upgraded.DecideApproval(ctx, approval.ID, domain.ApprovalApproved)
+
+	events := replayAll(t, backend, runID)
+	if n := countTerminal(events); n != 1 {
+		t.Fatalf("terminal events = %d, want exactly 1", n)
+	}
+	lastRunFailed(t, backend, runID)
+	if indexOfType(events, domain.EventToolStarted) >= 0 {
+		t.Fatal("the approved tool ran from a checkpoint written by another engine version")
 	}
 }
 

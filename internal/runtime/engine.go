@@ -151,7 +151,7 @@ type Engine struct {
 	setRetryDecider func(ModelRetryDecider)
 }
 
-// EngineFactory pins the production LoopDriver to the Eino v0.9.13 APIs used
+// EngineFactory pins the production LoopDriver to the Eino v0.9.21 APIs used
 // by NewEngine: adk.NewChatModelAgent, adk.NewRunner, Runner.Run/Query, and
 // Runner.ResumeWithParams. The model value stays inside this quarantined
 // package; internal/modules/loop sees only Vivy runtime types.

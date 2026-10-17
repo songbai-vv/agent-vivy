@@ -3038,7 +3038,8 @@ func (s *Service) questionDetails(ctx context.Context, runID domain.RunID) (stri
 // terminal event so no non-terminal row outlives the process (FR-8).
 func (s *Service) failUnrecoverable(ctx context.Context, runID domain.RunID, reason string) {
 	m := newEventMapper(runID, 0)
-	if run, err := s.deps.Runs.GetRun(ctx, runID); err == nil && run.Kind == domain.RunKindChild {
+	run, err := s.deps.Runs.GetRun(ctx, runID)
+	if err == nil && run.Kind == domain.RunKindChild {
 		if s.deps.Approvals != nil {
 			if approvals, listErr := s.deps.Approvals.ListPendingApprovals(ctx); listErr == nil {
 				for _, approval := range approvals {
@@ -3059,6 +3060,11 @@ func (s *Service) failUnrecoverable(ctx context.Context, runID domain.RunID, rea
 		CauseCategory: causeInternalError,
 		Message:       "The run was interrupted by a server restart and could not be recovered. Please try again.",
 	}))
+	// emitTerminal closes a pending Plan review only for runs this process
+	// registered; a recovered run is not registered, so close it here.
+	if err == nil {
+		s.cancelPlanReviewForRun(ctx, run.SessionID, runID)
+	}
 	slog.Info("restart recovery: run failed definitively", "run", string(runID), "reason", reason)
 }
 

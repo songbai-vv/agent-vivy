@@ -278,6 +278,114 @@ func TestPlanGoalIntegratedPendingReviewRecovery(t *testing.T) {
 	}
 }
 
+// An Eino upgrade invalidates checkpoints written by the previous engine.
+// A Plan review suspended before the upgrade cannot resume, so recovery must
+// fail its run and close the review instead of leaving it pending on a run
+// that will never continue.
+func TestPlanGoalPendingReviewAcrossEngineUpgradeSettles(t *testing.T) {
+	planGoalTestProvider(t, newPlanGoalScriptServer(t, []planGoalReply{
+		{tool: tools.SubmitPlanName, args: `{"markdown":"Review this durable plan."}`},
+	}).URL)
+	cfg, workspace := planGoalTestConfig(t, []string{tools.SubmitPlanName})
+	a := openPlanGoalTestApp(t, cfg)
+	client, err := a.DialControl(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := callControl(t, client, "session/create", map[string]any{"title": "upgrade review", "workspace_path": workspace})
+	sessionID := session["id"].(string)
+	callControl(t, client, "session/set_permission", map[string]any{"session_id": sessionID, "preset": "trusted"})
+	callControl(t, client, "plan/enter", map[string]any{"session_id": sessionID, "request_id": "enter-upgrade", "expected_version": 0})
+	turn := callControl(t, client, "turn/start", map[string]any{"session_id": sessionID, "text": "Submit a plan."})
+	runID := turn["run_id"].(string)
+	waitFor(t, 60*time.Second, func() bool {
+		state, err := a.backend.(storage.WorkStore).ReadWork(context.Background(), domain.SessionID(sessionID))
+		return err == nil && state.Plan.ReviewStatus == domain.PlanReviewPending && state.Plan.ResumeTarget != ""
+	})
+	_ = client.Close()
+	if err := a.backend.Close(); err != nil {
+		t.Fatalf("simulate process loss: %v", err)
+	}
+	_ = a.Close()
+
+	runtime.SetEngineVersionOverride(pinnedEinoVersion + "-next")
+	restarted := openPlanGoalTestApp(t, cfg)
+	replay, err := restarted.DialControl(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replay.Close()
+	run := callControl(t, replay, "run/get", map[string]any{"run_id": runID})
+	if run["status"] != "failed" {
+		t.Fatalf("run paused across the upgrade = %v, want failed", run)
+	}
+	work := callControl(t, replay, "session/work/get", map[string]any{"session_id": sessionID})
+	plan, _ := work["plan"].(map[string]any)
+	if plan["review_status"] != "cancelled" || plan["active"] != true {
+		t.Fatalf("Plan review after the upgrade = %v, want cancelled with Plan still active", work)
+	}
+}
+
+// A Goal round paused on a question before an Eino upgrade cannot resume.
+// Recovery fails the round's run and the Goal settles as blocked, so it is
+// neither left running nor silently re-admitted.
+func TestPlanGoalPausedRoundAcrossEngineUpgradeSettles(t *testing.T) {
+	planGoalTestProvider(t, newPlanGoalScriptServer(t, []planGoalReply{
+		{tool: tools.AskUserName, args: `{"question":"Which file?"}`},
+	}).URL)
+	cfg, workspace := planGoalTestConfig(t, []string{tools.AskUserName})
+	a := openPlanGoalTestApp(t, cfg)
+	client, err := a.DialControl(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := callControl(t, client, "session/create", map[string]any{"title": "upgrade goal", "workspace_path": workspace})
+	sessionID := session["id"].(string)
+	callControl(t, client, "goal/create", map[string]any{
+		"session_id": sessionID, "request_id": "goal-upgrade", "expected_version": 0,
+		"goal_id": "goal-upgrade", "goal_revision": 1, "objective": "Ask before acting.", "max_rounds": 3,
+	})
+	var roundRun domain.RunID
+	waitFor(t, 60*time.Second, func() bool {
+		questions, err := a.backend.ListPendingQuestions(context.Background())
+		if err != nil || len(questions) != 1 {
+			return false
+		}
+		roundRun = questions[0].RunID
+		return true
+	})
+	_ = client.Close()
+	if err := a.backend.Close(); err != nil {
+		t.Fatalf("simulate process loss: %v", err)
+	}
+	_ = a.Close()
+
+	runtime.SetEngineVersionOverride(pinnedEinoVersion + "-next")
+	restarted := openPlanGoalTestApp(t, cfg)
+	replay, err := restarted.DialControl(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replay.Close()
+	if run := callControl(t, replay, "run/get", map[string]any{"run_id": string(roundRun)}); run["status"] != "failed" {
+		t.Fatalf("Goal round paused across the upgrade = %v, want failed", run)
+	}
+	var work map[string]any
+	waitFor(t, 30*time.Second, func() bool {
+		work = callControl(t, replay, "session/work/get", map[string]any{"session_id": sessionID})
+		goal, _ := work["goal"].(map[string]any)
+		return goal["phase"] == "blocked"
+	})
+	goal := work["goal"].(map[string]any)
+	if goal["reason"] != "goal round failed" || goal["evidence_run_id"] != string(roundRun) {
+		t.Fatalf("Goal after the upgrade = %v", work)
+	}
+	runs, err := restarted.backend.ListRunsBySession(context.Background(), domain.SessionID(sessionID))
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("upgrade re-admitted a Goal round: %v / %v", runs, err)
+	}
+}
+
 func TestPlanGoalIntegratedRoundLimitBlocksDurably(t *testing.T) {
 	planGoalTestProvider(t, newPlanGoalScriptServer(t, []planGoalReply{{text: "One round ended without report_goal."}}).URL)
 	cfg, workspace := planGoalTestConfig(t, nil)
